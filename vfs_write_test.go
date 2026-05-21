@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"crypto/rand"
 	"fmt"
 	"io"
 	"log/slog"
@@ -23,9 +24,10 @@ import (
 
 // writeTestReplicaClient is a mock ReplicaClient for testing write functionality.
 type writeTestReplicaClient struct {
-	mu       sync.Mutex
-	ltxFiles map[int][]*ltx.FileInfo // level -> files
-	ltxData  map[string][]byte       // "level/minTXID-maxTXID" -> data
+	mu            sync.Mutex
+	ltxFiles      map[int][]*ltx.FileInfo // level -> files
+	ltxData       map[string][]byte       // "level/minTXID-maxTXID" -> data
+	writeErr      error                   // if set, WriteLTXFile returns this error
 }
 
 func newWriteTestReplicaClient() *writeTestReplicaClient {
@@ -81,6 +83,10 @@ func (c *writeTestReplicaClient) WriteLTXFile(ctx context.Context, level int, mi
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
+
+	if c.writeErr != nil {
+		return nil, c.writeErr
+	}
 
 	key := ltxKey(level, minTXID, maxTXID)
 	c.ltxData[key] = data
@@ -203,7 +209,7 @@ func setupWriteableVFSFile(t *testing.T, client *writeTestReplicaClient) *VFSFil
 	logger := slog.Default()
 	f := NewVFSFile(client, "test.db", logger)
 	f.writeEnabled = true
-	f.dirty = make(map[uint32]int64)
+	f.pendingDirty = make(map[uint32]int64)
 	f.syncInterval = 0
 
 	// Create a temporary buffer file
@@ -211,15 +217,15 @@ func setupWriteableVFSFile(t *testing.T, client *writeTestReplicaClient) *VFSFil
 	if err != nil {
 		t.Fatal(err)
 	}
-	f.bufferFile = tmpFile
-	f.bufferPath = tmpFile.Name()
-	f.bufferNextOff = 0
+	f.pendingBufferFile = tmpFile
+	f.pendingBufferPath = tmpFile.Name()
+	f.pendingBufferNextOff = 0
 
 	t.Cleanup(func() {
-		if f.bufferFile != nil {
-			f.bufferFile.Close()
+		if f.pendingBufferFile != nil {
+			f.pendingBufferFile.Close()
 		}
-		os.Remove(f.bufferPath)
+		os.Remove(f.pendingBufferPath)
 	})
 
 	return f
@@ -241,9 +247,9 @@ func TestVFSFile_WriteEnabled(t *testing.T) {
 	logger := slog.Default()
 	f := NewVFSFile(client, "test.db", logger)
 	f.writeEnabled = true
-	f.dirty = make(map[uint32]int64)
+	f.pendingDirty = make(map[uint32]int64)
 	f.syncInterval = 0
-	f.bufferPath = bufferPath
+	f.pendingBufferPath = bufferPath
 
 	if err := f.Open(); err != nil {
 		t.Fatal(err)
@@ -254,7 +260,7 @@ func TestVFSFile_WriteEnabled(t *testing.T) {
 		t.Error("expected writeEnabled to be true")
 	}
 
-	if f.dirty == nil {
+	if f.pendingDirty == nil {
 		t.Error("expected dirty map to be initialized")
 	}
 }
@@ -287,10 +293,10 @@ func TestVFSFile_WriteAt(t *testing.T) {
 	}
 
 	// Check dirty page exists
-	if len(f.dirty) != 1 {
-		t.Errorf("expected 1 dirty page, got %d", len(f.dirty))
+	if len(f.pendingDirty) != 1 {
+		t.Errorf("expected 1 dirty page, got %d", len(f.pendingDirty))
 	}
-	if _, ok := f.dirty[1]; !ok {
+	if _, ok := f.pendingDirty[1]; !ok {
 		t.Error("expected page 1 to be dirty")
 	}
 
@@ -333,8 +339,8 @@ func TestVFSFile_SyncToRemote(t *testing.T) {
 	}
 
 	// Check dirty pages are cleared
-	if len(f.dirty) != 0 {
-		t.Errorf("expected 0 dirty pages after sync, got %d", len(f.dirty))
+	if len(f.pendingDirty) != 0 {
+		t.Errorf("expected 0 dirty pages after sync, got %d", len(f.pendingDirty))
 	}
 
 	// Check TXID advanced
@@ -418,7 +424,7 @@ func TestVFSFile_TransactionTracking(t *testing.T) {
 	if err := f.Sync(0); err != nil {
 		t.Fatal(err)
 	}
-	if len(f.dirty) == 0 {
+	if len(f.pendingDirty) == 0 {
 		t.Error("expected dirty pages to remain during transaction")
 	}
 
@@ -435,7 +441,7 @@ func TestVFSFile_TransactionTracking(t *testing.T) {
 	if err := f.Sync(0); err != nil {
 		t.Fatal(err)
 	}
-	if len(f.dirty) != 0 {
+	if len(f.pendingDirty) != 0 {
 		t.Error("expected dirty pages to be cleared after sync")
 	}
 }
@@ -468,7 +474,7 @@ func TestVFSFile_Truncate(t *testing.T) {
 	}
 
 	// Page 2 should no longer be dirty
-	if _, ok := f.dirty[2]; ok {
+	if _, ok := f.pendingDirty[2]; ok {
 		t.Error("expected page 2 to be removed from dirty pages")
 	}
 
@@ -495,9 +501,9 @@ func TestVFSFile_WriteBuffer(t *testing.T) {
 	logger := slog.Default()
 	f := NewVFSFile(client, "test.db", logger)
 	f.writeEnabled = true
-	f.dirty = make(map[uint32]int64)
+	f.pendingDirty = make(map[uint32]int64)
 	f.syncInterval = 0
-	f.bufferPath = bufferPath
+	f.pendingBufferPath = bufferPath
 
 	if err := f.Open(); err != nil {
 		t.Fatal(err)
@@ -520,8 +526,8 @@ func TestVFSFile_WriteBuffer(t *testing.T) {
 
 	// Don't call f.Close() - simulate a crash by just abandoning the file handle
 	// Close just the buffer file directly to release the handle
-	if f.bufferFile != nil {
-		f.bufferFile.Close()
+	if f.pendingBufferFile != nil {
+		f.pendingBufferFile.Close()
 	}
 	f.cancel() // Stop any goroutines
 
@@ -553,9 +559,9 @@ func TestVFSFile_WriteBufferDiscardedOnOpen(t *testing.T) {
 	logger := slog.Default()
 	f1 := NewVFSFile(client, "test.db", logger)
 	f1.writeEnabled = true
-	f1.dirty = make(map[uint32]int64)
+	f1.pendingDirty = make(map[uint32]int64)
 	f1.syncInterval = 0
-	f1.bufferPath = bufferPath
+	f1.pendingBufferPath = bufferPath
 
 	if err := f1.Open(); err != nil {
 		t.Fatal(err)
@@ -569,17 +575,17 @@ func TestVFSFile_WriteBufferDiscardedOnOpen(t *testing.T) {
 	}
 
 	// Simulate crash by abandoning the file handle without syncing
-	if f1.bufferFile != nil {
-		f1.bufferFile.Close()
+	if f1.pendingBufferFile != nil {
+		f1.pendingBufferFile.Close()
 	}
 	f1.cancel()
 
 	// Second: create a new VFSFile - buffer should be discarded
 	f2 := NewVFSFile(client, "test.db", logger)
 	f2.writeEnabled = true
-	f2.dirty = make(map[uint32]int64)
+	f2.pendingDirty = make(map[uint32]int64)
 	f2.syncInterval = 0
-	f2.bufferPath = bufferPath
+	f2.pendingBufferPath = bufferPath
 
 	if err := f2.Open(); err != nil {
 		t.Fatal(err)
@@ -587,8 +593,8 @@ func TestVFSFile_WriteBufferDiscardedOnOpen(t *testing.T) {
 	defer f2.Close()
 
 	// Dirty pages should NOT be recovered - buffer is discarded on open
-	if len(f2.dirty) != 0 {
-		t.Errorf("expected 0 dirty pages (buffer should be discarded), got %d", len(f2.dirty))
+	if len(f2.pendingDirty) != 0 {
+		t.Errorf("expected 0 dirty pages (buffer should be discarded), got %d", len(f2.pendingDirty))
 	}
 
 	// Reading should return original data from replica, not unsync'd data
@@ -617,9 +623,9 @@ func TestVFSFile_WriteBufferClearAfterSync(t *testing.T) {
 	logger := slog.Default()
 	f := NewVFSFile(client, "test.db", logger)
 	f.writeEnabled = true
-	f.dirty = make(map[uint32]int64)
+	f.pendingDirty = make(map[uint32]int64)
 	f.syncInterval = 0
-	f.bufferPath = bufferPath
+	f.pendingBufferPath = bufferPath
 
 	if err := f.Open(); err != nil {
 		t.Fatal(err)
@@ -659,9 +665,9 @@ func TestVFSFile_OpenFailsWithInvalidBufferPath(t *testing.T) {
 	logger := slog.Default()
 	f := NewVFSFile(client, "test.db", logger)
 	f.writeEnabled = true
-	f.dirty = make(map[uint32]int64)
+	f.pendingDirty = make(map[uint32]int64)
 	f.syncInterval = 0
-	f.bufferPath = "/nonexistent/path/that/cannot/be/created/buffer"
+	f.pendingBufferPath = "/nonexistent/path/that/cannot/be/created/buffer"
 
 	err := f.Open()
 	if err == nil {
@@ -683,16 +689,16 @@ func TestVFSFile_BufferFileAlwaysCreatedWhenWriteEnabled(t *testing.T) {
 	logger := slog.Default()
 	f := NewVFSFile(client, "test.db", logger)
 	f.writeEnabled = true
-	f.dirty = make(map[uint32]int64)
+	f.pendingDirty = make(map[uint32]int64)
 	f.syncInterval = 0
-	f.bufferPath = bufferPath
+	f.pendingBufferPath = bufferPath
 
 	if err := f.Open(); err != nil {
 		t.Fatal(err)
 	}
 	defer f.Close()
 
-	if f.bufferFile == nil {
+	if f.pendingBufferFile == nil {
 		t.Fatal("bufferFile should never be nil when writeEnabled is true")
 	}
 }
@@ -710,9 +716,9 @@ func TestVFSFile_OpenNewDatabase(t *testing.T) {
 	logger := slog.Default()
 	f := NewVFSFile(client, "new.db", logger)
 	f.writeEnabled = true
-	f.dirty = make(map[uint32]int64)
+	f.pendingDirty = make(map[uint32]int64)
 	f.syncInterval = 0
-	f.bufferPath = bufferPath
+	f.pendingBufferPath = bufferPath
 
 	if err := f.Open(); err != nil {
 		t.Fatal(err)
@@ -751,9 +757,9 @@ func TestVFSFile_NewDatabase_ReadReturnsZeros(t *testing.T) {
 	logger := slog.Default()
 	f := NewVFSFile(client, "new.db", logger)
 	f.writeEnabled = true
-	f.dirty = make(map[uint32]int64)
+	f.pendingDirty = make(map[uint32]int64)
 	f.syncInterval = 0
-	f.bufferPath = bufferPath
+	f.pendingBufferPath = bufferPath
 
 	if err := f.Open(); err != nil {
 		t.Fatal(err)
@@ -789,9 +795,9 @@ func TestVFSFile_NewDatabase_WriteAndSync(t *testing.T) {
 	logger := slog.Default()
 	f := NewVFSFile(client, "new.db", logger)
 	f.writeEnabled = true
-	f.dirty = make(map[uint32]int64)
+	f.pendingDirty = make(map[uint32]int64)
 	f.syncInterval = 0
-	f.bufferPath = bufferPath
+	f.pendingBufferPath = bufferPath
 
 	if err := f.Open(); err != nil {
 		t.Fatal(err)
@@ -809,8 +815,8 @@ func TestVFSFile_NewDatabase_WriteAndSync(t *testing.T) {
 	}
 
 	// Verify dirty page exists
-	if len(f.dirty) != 1 {
-		t.Errorf("expected 1 dirty page, got %d", len(f.dirty))
+	if len(f.pendingDirty) != 1 {
+		t.Errorf("expected 1 dirty page, got %d", len(f.pendingDirty))
 	}
 
 	// Sync to remote
@@ -850,9 +856,9 @@ func TestVFSFile_NewDatabase_FileSize(t *testing.T) {
 	logger := slog.Default()
 	f := NewVFSFile(client, "new.db", logger)
 	f.writeEnabled = true
-	f.dirty = make(map[uint32]int64)
+	f.pendingDirty = make(map[uint32]int64)
 	f.syncInterval = 0
-	f.bufferPath = bufferPath
+	f.pendingBufferPath = bufferPath
 
 	if err := f.Open(); err != nil {
 		t.Fatal(err)
@@ -956,7 +962,7 @@ func TestSetWriteEnabled_DisableSyncsDirtyPages(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if len(f.dirty) == 0 {
+	if len(f.pendingDirty) == 0 {
 		t.Fatal("expected dirty pages")
 	}
 
@@ -966,8 +972,8 @@ func TestSetWriteEnabled_DisableSyncsDirtyPages(t *testing.T) {
 	}
 
 	// Dirty pages should be synced
-	if len(f.dirty) != 0 {
-		t.Errorf("expected 0 dirty pages after disable, got %d", len(f.dirty))
+	if len(f.pendingDirty) != 0 {
+		t.Errorf("expected 0 dirty pages after disable, got %d", len(f.pendingDirty))
 	}
 
 	// Write support should be disabled
@@ -1098,7 +1104,7 @@ func TestSetWriteEnabled_EnableAfterDisable(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if len(f.dirty) == 0 {
+	if len(f.pendingDirty) == 0 {
 		t.Error("expected dirty pages after write")
 	}
 }
@@ -1190,12 +1196,12 @@ func TestSetWriteEnabled_ColdEnable(t *testing.T) {
 	}
 
 	// Verify buffer was initialized
-	if f.bufferFile == nil {
+	if f.pendingBufferFile == nil {
 		t.Error("expected bufferFile to be initialized")
 	}
 
 	// Verify dirty map was initialized
-	if f.dirty == nil {
+	if f.pendingDirty == nil {
 		t.Error("expected dirty map to be initialized")
 	}
 
@@ -1210,7 +1216,7 @@ func TestSetWriteEnabled_ColdEnable(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if len(f.dirty) == 0 {
+	if len(f.pendingDirty) == 0 {
 		t.Error("expected dirty pages after write")
 	}
 }
@@ -1389,7 +1395,7 @@ func TestSetWriteEnabled_SyncFailureKeepsWritesEnabled(t *testing.T) {
 	logger := slog.Default()
 	f := NewVFSFile(client, "test.db", logger)
 	f.writeEnabled = true
-	f.dirty = make(map[uint32]int64)
+	f.pendingDirty = make(map[uint32]int64)
 	f.syncInterval = 0
 
 	// Create a temporary buffer file
@@ -1397,15 +1403,15 @@ func TestSetWriteEnabled_SyncFailureKeepsWritesEnabled(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	f.bufferFile = tmpFile
-	f.bufferPath = tmpFile.Name()
-	f.bufferNextOff = 0
+	f.pendingBufferFile = tmpFile
+	f.pendingBufferPath = tmpFile.Name()
+	f.pendingBufferNextOff = 0
 
 	t.Cleanup(func() {
-		if f.bufferFile != nil {
-			f.bufferFile.Close()
+		if f.pendingBufferFile != nil {
+			f.pendingBufferFile.Close()
 		}
-		os.Remove(f.bufferPath)
+		os.Remove(f.pendingBufferPath)
 	})
 
 	if err := f.Open(); err != nil {
@@ -1419,7 +1425,7 @@ func TestSetWriteEnabled_SyncFailureKeepsWritesEnabled(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if len(f.dirty) == 0 {
+	if len(f.pendingDirty) == 0 {
 		t.Fatal("expected dirty pages")
 	}
 
@@ -1438,7 +1444,7 @@ func TestSetWriteEnabled_SyncFailureKeepsWritesEnabled(t *testing.T) {
 	}
 
 	// Dirty pages should still exist
-	if len(f.dirty) == 0 {
+	if len(f.pendingDirty) == 0 {
 		t.Error("expected dirty pages to remain after sync failure")
 	}
 }
@@ -1923,8 +1929,8 @@ func TestVFS_UniqueBufferPaths(t *testing.T) {
 	f1 := openWriteVFSFile(t, v)
 	f2 := openWriteVFSFile(t, v)
 
-	if f1.bufferPath == f2.bufferPath {
-		t.Errorf("buffer paths should be unique: both are %q", f1.bufferPath)
+	if f1.pendingBufferPath == f2.pendingBufferPath {
+		t.Errorf("buffer paths should be unique: both are %q", f1.pendingBufferPath)
 	}
 }
 
@@ -1991,7 +1997,7 @@ func TestVFS_CloseReleasesWriteSlot(t *testing.T) {
 }
 
 // TestVFSFile_FileSize_AfterSync verifies that FileSize does not shrink after
-// syncToRemoteWithLock clears f.dirty. Before the fix, if dirty pages extended
+// syncToRemoteWithLock clears f.pendingDirty. Before the fix, if dirty pages extended
 // the database beyond f.index and a sync cleared them before the poll goroutine
 // repopulated f.index, FileSize would transiently return a smaller value,
 // causing SQLite to report "database disk image is malformed".
@@ -2031,7 +2037,7 @@ func TestVFSFile_FileSize_AfterSync(t *testing.T) {
 		}
 	}
 
-	// FileSize after writes should reflect 10 pages (via f.dirty).
+	// FileSize after writes should reflect 10 pages (via f.pendingDirty).
 	sizeAfterWrite, err := f.FileSize()
 	if err != nil {
 		t.Fatal(err)
@@ -2040,7 +2046,7 @@ func TestVFSFile_FileSize_AfterSync(t *testing.T) {
 		t.Fatalf("FileSize after write = %d, want %d", sizeAfterWrite, want)
 	}
 
-	// Sync: uploads dirty pages and clears f.dirty.
+	// Sync: uploads dirty pages and clears f.pendingDirty.
 	// We do NOT poll afterwards, so f.index still only knows about pages 1-2.
 	if err := f.Sync(0); err != nil {
 		t.Fatal(err)
@@ -2048,7 +2054,7 @@ func TestVFSFile_FileSize_AfterSync(t *testing.T) {
 
 	// Verify dirty was actually cleared (sync happened).
 	f.mu.Lock()
-	dirtyLen := len(f.dirty)
+	dirtyLen := len(f.pendingDirty)
 	indexMax := uint32(0)
 	for pgno := range f.index {
 		if pgno > indexMax {
@@ -2075,5 +2081,395 @@ func TestVFSFile_FileSize_AfterSync(t *testing.T) {
 	if sizeAfterSync < sizeAfterWrite {
 		t.Errorf("FileSize shrank after sync: was %d, now %d (index covers up to page %d, dirty cleared)",
 			sizeAfterWrite, sizeAfterSync, indexMax)
+	}
+}
+
+// --- Shared Dirty Map Tests ---
+
+// TestSharedDirty_ReadAfterWrite verifies that a reader connection sees pages
+// committed by the writer immediately, without waiting for S3 sync.
+func TestSharedDirty_ReadAfterWrite(t *testing.T) {
+	client := newWriteTestReplicaClient()
+	pageSize := uint32(4096)
+	initialPage := make([]byte, pageSize)
+	copy(initialPage, "initial")
+	createTestLTXFile(t, client, 1, pageSize, 1, map[uint32][]byte{1: initialPage})
+
+	v := NewVFS(client, slog.Default())
+	v.WriteEnabled = true
+
+	writer := openWriteVFSFile(t, v)
+	reader := openWriteVFSFile(t, v)
+
+	// Writer: acquire lock, write page 2, commit (unlock).
+	if err := writer.Lock(sqlite3vfs.LockReserved); err != nil {
+		t.Fatal(err)
+	}
+	writeData := make([]byte, pageSize)
+	copy(writeData, "hello from writer")
+	if _, err := writer.WriteAt(writeData, int64(pageSize)); err != nil { // page 2
+		t.Fatal(err)
+	}
+	if err := writer.Unlock(sqlite3vfs.LockShared); err != nil {
+		t.Fatal(err)
+	}
+
+	// Reader: read page 2 — must see "hello from writer" immediately.
+	readBuf := make([]byte, pageSize)
+	if _, err := reader.ReadAt(readBuf, int64(pageSize)); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.HasPrefix(readBuf, []byte("hello from writer")) {
+		t.Errorf("reader did not see committed write; got %q", readBuf[:20])
+	}
+}
+
+// TestSharedDirty_UncommittedNotVisible verifies that a reader does NOT see
+// pages that the writer has written but not yet committed.
+func TestSharedDirty_UncommittedNotVisible(t *testing.T) {
+	client := newWriteTestReplicaClient()
+	pageSize := uint32(4096)
+	initialPage := make([]byte, pageSize)
+	copy(initialPage, "initial")
+	createTestLTXFile(t, client, 1, pageSize, 1, map[uint32][]byte{1: initialPage})
+
+	v := NewVFS(client, slog.Default())
+	v.WriteEnabled = true
+
+	writer := openWriteVFSFile(t, v)
+	reader := openWriteVFSFile(t, v)
+
+	// Writer: acquire lock, write page 2, do NOT commit.
+	if err := writer.Lock(sqlite3vfs.LockReserved); err != nil {
+		t.Fatal(err)
+	}
+	writeData := make([]byte, pageSize)
+	copy(writeData, "uncommitted data")
+	if _, err := writer.WriteAt(writeData, int64(pageSize)); err != nil {
+		t.Fatal(err)
+	}
+
+	// Reader: read page 2 — should get zeros (page doesn't exist in index/shared).
+	readBuf := make([]byte, pageSize)
+	if _, err := reader.ReadAt(readBuf, int64(pageSize)); err != nil {
+		t.Fatal(err)
+	}
+	if bytes.HasPrefix(readBuf, []byte("uncommitted data")) {
+		t.Error("reader saw uncommitted write — isolation violation")
+	}
+
+	// Rollback: unlock without syncing.
+	writer.mu.Lock()
+	writer.pendingDirty = make(map[uint32]int64)
+	writer.inTransaction = false
+	if writer.vfs != nil {
+		writer.vfs.writeMu.Lock()
+		if writer.vfs.writeFile == writer {
+			writer.vfs.writeFile = nil
+		}
+		writer.vfs.writeMu.Unlock()
+	}
+	writer.mu.Unlock()
+
+	// Shared dirty should still be empty.
+	v.commitMu.RLock()
+	sharedLen := len(v.sharedDirty)
+	v.commitMu.RUnlock()
+	if sharedLen != 0 {
+		t.Errorf("expected 0 shared dirty pages after rollback, got %d", sharedLen)
+	}
+}
+
+// TestSharedDirty_FileSizeAfterSync verifies that a reader's FileSize does not
+// shrink after sync clears sharedDirty (the sharedCommit anchor).
+func TestSharedDirty_FileSizeAfterSync(t *testing.T) {
+	client := newWriteTestReplicaClient()
+	pageSize := uint32(4096)
+	pages := make(map[uint32][]byte)
+	for pgno := uint32(1); pgno <= 2; pgno++ {
+		pages[pgno] = make([]byte, pageSize)
+	}
+	createTestLTXFile(t, client, 1, pageSize, 2, pages)
+
+	v := NewVFS(client, slog.Default())
+	v.WriteEnabled = true
+
+	writer := openWriteVFSFile(t, v)
+	reader := openWriteVFSFile(t, v)
+
+	// Writer: write pages 3..10, commit.
+	if err := writer.Lock(sqlite3vfs.LockReserved); err != nil {
+		t.Fatal(err)
+	}
+	for pgno := uint32(3); pgno <= 10; pgno++ {
+		data := make([]byte, pageSize)
+		if _, err := writer.WriteAt(data, int64(pgno-1)*int64(pageSize)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := writer.Unlock(sqlite3vfs.LockShared); err != nil {
+		t.Fatal(err)
+	}
+
+	// Reader FileSize should reflect 10 pages.
+	sizeBeforeSync, err := reader.FileSize()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := int64(10) * int64(pageSize); sizeBeforeSync != want {
+		t.Fatalf("reader FileSize before sync = %d, want %d", sizeBeforeSync, want)
+	}
+
+	// Sync: uploads shared dirty and clears it.
+	writer.mu.Lock()
+	if err := writer.syncToRemoteWithLock(); err != nil {
+		writer.mu.Unlock()
+		t.Fatal(err)
+	}
+	writer.mu.Unlock()
+
+	// Verify shared dirty was cleared.
+	v.commitMu.RLock()
+	sharedLen := len(v.sharedDirty)
+	v.commitMu.RUnlock()
+	if sharedLen != 0 {
+		t.Fatalf("expected 0 shared dirty after sync, got %d", sharedLen)
+	}
+
+	// Reader FileSize must NOT shrink — sharedCommit anchors it.
+	sizeAfterSync, err := reader.FileSize()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sizeAfterSync < sizeBeforeSync {
+		t.Errorf("reader FileSize shrank after sync: was %d, now %d", sizeBeforeSync, sizeAfterSync)
+	}
+}
+
+// TestSharedDirty_SyncFailureRetainsPages verifies that a failed S3 upload
+// does not clear sharedDirty, and readers continue to see committed pages.
+func TestSharedDirty_SyncFailureRetainsPages(t *testing.T) {
+	client := newWriteTestReplicaClient()
+	pageSize := uint32(4096)
+	initialPage := make([]byte, pageSize)
+	createTestLTXFile(t, client, 1, pageSize, 1, map[uint32][]byte{1: initialPage})
+
+	v := NewVFS(client, slog.Default())
+	v.WriteEnabled = true
+
+	writer := openWriteVFSFile(t, v)
+	reader := openWriteVFSFile(t, v)
+
+	// Writer: write page 2 and commit.
+	if err := writer.Lock(sqlite3vfs.LockReserved); err != nil {
+		t.Fatal(err)
+	}
+	writeData := make([]byte, pageSize)
+	copy(writeData, "persisted data")
+	if _, err := writer.WriteAt(writeData, int64(pageSize)); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Unlock(sqlite3vfs.LockShared); err != nil {
+		t.Fatal(err)
+	}
+
+	// Make future writes fail by injecting an error.
+	client.mu.Lock()
+	client.writeErr = fmt.Errorf("injected S3 failure")
+	client.mu.Unlock()
+
+	// Attempt sync — should fail.
+	writer.mu.Lock()
+	err := writer.syncToRemoteWithLock()
+	writer.mu.Unlock()
+	if err == nil {
+		t.Fatal("expected sync to fail")
+	}
+
+	// Shared dirty must still contain the page.
+	v.commitMu.RLock()
+	sharedLen := len(v.sharedDirty)
+	v.commitMu.RUnlock()
+	if sharedLen == 0 {
+		t.Error("shared dirty should retain pages after sync failure")
+	}
+
+	// Reader must still see the committed data.
+	readBuf := make([]byte, pageSize)
+	if _, err := reader.ReadAt(readBuf, int64(pageSize)); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.HasPrefix(readBuf, []byte("persisted data")) {
+		t.Errorf("reader lost committed data after sync failure; got %q", readBuf[:20])
+	}
+}
+
+// TestSharedDirty_JournalModePatchOnSharedRead verifies that page 1 read from
+// sharedDirty gets the journal mode patch applied (bytes 18-19 = 0x01,0x01).
+func TestSharedDirty_JournalModePatchOnSharedRead(t *testing.T) {
+	client := newWriteTestReplicaClient()
+	pageSize := uint32(4096)
+	initialPage := make([]byte, pageSize)
+	createTestLTXFile(t, client, 1, pageSize, 1, map[uint32][]byte{1: initialPage})
+
+	v := NewVFS(client, slog.Default())
+	v.WriteEnabled = true
+
+	writer := openWriteVFSFile(t, v)
+	reader := openWriteVFSFile(t, v)
+
+	// Writer: write page 1 with known bytes at positions 18-19, commit.
+	if err := writer.Lock(sqlite3vfs.LockReserved); err != nil {
+		t.Fatal(err)
+	}
+	page1 := make([]byte, pageSize)
+	page1[18], page1[19] = 0x02, 0x02 // WAL mode markers
+	// Fill bytes 24-28 with known pattern
+	copy(page1[24:28], []byte{0xAA, 0xBB, 0xCC, 0xDD})
+	if _, err := writer.WriteAt(page1, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Unlock(sqlite3vfs.LockShared); err != nil {
+		t.Fatal(err)
+	}
+
+	// Reader: read page 1 from sharedDirty.
+	readBuf := make([]byte, pageSize)
+	if _, err := reader.ReadAt(readBuf, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	// Journal mode patch must be applied: bytes 18-19 = 0x01,0x01.
+	if readBuf[18] != 0x01 || readBuf[19] != 0x01 {
+		t.Errorf("journal mode patch not applied: got bytes 18-19 = %02x %02x, want 01 01",
+			readBuf[18], readBuf[19])
+	}
+	// Bytes 24-28 should be randomized (not the original pattern).
+	if bytes.Equal(readBuf[24:28], []byte{0xAA, 0xBB, 0xCC, 0xDD}) {
+		t.Error("bytes 24-28 should be randomized by journal mode patch")
+	}
+}
+
+// TestSharedDirty_WriterPendingOverridesShared verifies that the writer's own
+// uncommitted (pending) pages take priority over sharedDirty in ReadAt.
+func TestSharedDirty_WriterPendingOverridesShared(t *testing.T) {
+	client := newWriteTestReplicaClient()
+	pageSize := uint32(4096)
+	initialPage := make([]byte, pageSize)
+	createTestLTXFile(t, client, 1, pageSize, 1, map[uint32][]byte{1: initialPage})
+
+	v := NewVFS(client, slog.Default())
+	v.WriteEnabled = true
+
+	writer := openWriteVFSFile(t, v)
+
+	// TX1: write page 2 with "tx1 data", commit.
+	if err := writer.Lock(sqlite3vfs.LockReserved); err != nil {
+		t.Fatal(err)
+	}
+	tx1Data := make([]byte, pageSize)
+	copy(tx1Data, "tx1 data")
+	if _, err := writer.WriteAt(tx1Data, int64(pageSize)); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Unlock(sqlite3vfs.LockShared); err != nil {
+		t.Fatal(err)
+	}
+
+	// TX2: write same page 2 with "tx2 data", do NOT commit.
+	if err := writer.Lock(sqlite3vfs.LockReserved); err != nil {
+		t.Fatal(err)
+	}
+	tx2Data := make([]byte, pageSize)
+	copy(tx2Data, "tx2 data")
+	if _, err := writer.WriteAt(tx2Data, int64(pageSize)); err != nil {
+		t.Fatal(err)
+	}
+
+	// Writer ReadAt should return "tx2 data" (pending), not "tx1 data" (shared).
+	readBuf := make([]byte, pageSize)
+	if _, err := writer.ReadAt(readBuf, int64(pageSize)); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.HasPrefix(readBuf, []byte("tx2 data")) {
+		t.Errorf("writer should see own pending write; got %q", readBuf[:20])
+	}
+
+	if err := writer.Unlock(sqlite3vfs.LockShared); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestSharedDirty_ConcurrentReadersAndWriter exercises the shared dirty map
+// under concurrent access with the race detector.
+func TestSharedDirty_ConcurrentReadersAndWriter(t *testing.T) {
+	client := newWriteTestReplicaClient()
+	pageSize := uint32(4096)
+	initialPage := make([]byte, pageSize)
+	_, _ = rand.Read(initialPage)
+	createTestLTXFile(t, client, 1, pageSize, 1, map[uint32][]byte{1: initialPage})
+
+	v := NewVFS(client, slog.Default())
+	v.WriteEnabled = true
+
+	writer := openWriteVFSFile(t, v)
+
+	const numReaders = 4
+	const numCommits = 20
+	readers := make([]*VFSFile, numReaders)
+	for i := range readers {
+		readers[i] = openWriteVFSFile(t, v)
+	}
+
+	var wg sync.WaitGroup
+	errCh := make(chan error, numReaders*numCommits)
+
+	// Readers: continuously read page 2.
+	for _, r := range readers {
+		wg.Add(1)
+		go func(reader *VFSFile) {
+			defer wg.Done()
+			buf := make([]byte, pageSize)
+			for i := 0; i < numCommits*5; i++ {
+				if _, err := reader.ReadAt(buf, int64(pageSize)); err != nil {
+					errCh <- fmt.Errorf("reader error: %w", err)
+					return
+				}
+				// Verify page is either zeros or a valid committed page.
+				if buf[0] != 0 && buf[0] != 0xAA {
+					errCh <- fmt.Errorf("unexpected page content: first byte = %02x", buf[0])
+					return
+				}
+			}
+		}(r)
+	}
+
+	// Writer: commit pages in a loop.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < numCommits; i++ {
+			if err := writer.Lock(sqlite3vfs.LockReserved); err != nil {
+				errCh <- fmt.Errorf("writer lock error: %w", err)
+				return
+			}
+			data := make([]byte, pageSize)
+			data[0] = 0xAA
+			if _, err := writer.WriteAt(data, int64(pageSize)); err != nil {
+				errCh <- fmt.Errorf("writer write error: %w", err)
+				return
+			}
+			if err := writer.Unlock(sqlite3vfs.LockShared); err != nil {
+				errCh <- fmt.Errorf("writer unlock error: %w", err)
+				return
+			}
+		}
+	}()
+
+	wg.Wait()
+	close(errCh)
+
+	for err := range errCh {
+		t.Error(err)
 	}
 }
