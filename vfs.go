@@ -592,6 +592,7 @@ type VFSFile struct {
 	syncStop      chan struct{}    // Signal to stop sync loop
 	inTransaction       bool       // True during active write transaction
 	syncedInTx          bool       // True if xSync was called during the current tx (commit barrier passed)
+	localShippedMaxTXID ltx.TXID   // Highest TXID this VFSFile has shipped; index updates older than this are stale
 	disabling           bool       // True when write disable is in progress
 	cond                *sync.Cond // Signals transaction state changes
 
@@ -2082,6 +2083,7 @@ func (f *VFSFile) syncToRemoteWithLock() error {
 	f.expectedTXID = f.pendingTXID
 	f.pendingTXID++
 	f.pos = ltx.Pos{TXID: f.expectedTXID}
+	f.localShippedMaxTXID = f.expectedTXID
 
 	if f.vfs != nil {
 		f.vfs.writeMu.Lock()
@@ -2094,6 +2096,24 @@ func (f *VFSFile) syncToRemoteWithLock() error {
 	// Update cache with synced pages from snapshot.
 	for pgno, data := range snapshot {
 		f.cache.Add(pgno, data)
+	}
+
+	// Update f.index so subsequent cache misses fetch from the LTX file we
+	// just uploaded, not from an older one. Without this the poller is the
+	// only path that updates f.index, and a poll racing this ship can see an
+	// older listing and either skip this entry or — worse — set f.index back
+	// to an older LTX after a later ship has already advanced it. The MaxTXID
+	// check below in pollReplicaClient relies on f.index being current.
+	if idx, err := FetchPageIndex(ctx, f.client, info); err != nil {
+		// Non-fatal: future polls will fill this in.
+		f.logger.Warn("fetch page index after ship", "txid", info.MaxTXID, "error", err)
+	} else {
+		for pgno, elem := range idx {
+			if existing, ok := f.index[pgno]; ok && existing.MaxTXID >= elem.MaxTXID {
+				continue
+			}
+			f.index[pgno] = elem
+		}
 	}
 
 	// Apply synced pages to hydrated file if hydration is complete.
@@ -2582,12 +2602,22 @@ func (f *VFSFile) Unlock(elock sqlite3vfs.LockType) error {
 		// Invalidate entire cache since we replaced the index
 		f.cache.Purge()
 	} else if len(f.pending) > 0 {
-		// Merge pending into index
+		// Merge pending into index. f.pending was queued during a tx by the
+		// poller; meanwhile, the local syncer may have written a NEWER LTX
+		// entry into f.index for the same pages (the syncer's ship runs
+		// whenever inTransaction is false, which includes SHARED-only read
+		// txs). Skip merges that would regress f.index — and the cache.Remove
+		// that would drop the fresh entries the syncer just installed.
+		count := 0
 		for k, v := range f.pending {
+			if existing, ok := f.index[k]; ok && existing.MaxTXID >= v.MaxTXID {
+				continue
+			}
 			f.index[k] = v
 			f.cache.Remove(k)
+			count++
 		}
-		f.logger.Debug("cache invalidated pages", "count", len(f.pending))
+		f.logger.Debug("cache invalidated pages", "count", count)
 	}
 	f.pending = make(map[uint32]ltx.PageIndexElem)
 	f.pendingReplace = false
@@ -2902,7 +2932,15 @@ func (f *VFSFile) pollReplicaClient(ctx context.Context) error {
 			f.pendingReplace = true
 		}
 	}
+	// When poll's listing started, it captured a snapshot of LTX files. If a
+	// local sync shipped a newer LTX file BETWEEN that listing and now, our
+	// combined[k] for some pages will be stale. Apply the update only if it
+	// is monotonically newer than what we already have, otherwise both the
+	// f.index regression and the cache.Remove would drop fresh local state.
 	for k, v := range combined {
+		if existing, ok := target[k]; ok && existing.MaxTXID >= v.MaxTXID {
+			continue
+		}
 		target[k] = v
 		if targetIsMain {
 			f.cache.Remove(k)
