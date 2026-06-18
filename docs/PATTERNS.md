@@ -439,7 +439,7 @@ Lock page numbers by page size:
 
 **Responsibilities:**
 
-- Manages SQLite database connection (via `modernc.org/sqlite` - no CGO)
+- Manages SQLite database connection (via `github.com/mattn/go-sqlite3` - cgo)
 - Monitors WAL for changes
 - Performs checkpoints
 - Maintains long-running read transaction

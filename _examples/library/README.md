@@ -13,24 +13,28 @@ API at your own risk, and pin to specific versions.
 per-process locks for SQLite, not per-handle locks. If you open the same
 database with two different SQLite driver implementations in the same process
 and close one of them, you can hit locking issues. You **must** use
-`modernc.org/sqlite` for your app since Litestream uses it internally.
+`github.com/mattn/go-sqlite3` for your app since Litestream uses it internally.
 
 ## Important Constraints
 
 When using Litestream as a library, be aware of these critical requirements:
 
-1. **Required Driver**: You must use `modernc.org/sqlite`. Litestream uses this
-   driver internally, and mixing drivers causes lock conflicts on POSIX systems.
+1. **Required Driver**: You must use `github.com/mattn/go-sqlite3`. Litestream
+   uses this driver internally, and mixing drivers causes lock conflicts on
+   POSIX systems. Because this driver is cgo-based, it also lets your app load
+   SQLite C extensions (`(*sqlite3.SQLiteConn).LoadExtension` or the
+   `SQLiteDriver{Extensions/ConnectHook}` fields); building requires
+   `CGO_ENABLED=1` and a C toolchain.
 
 2. **Lifecycle Management**: You cannot call `litestream.DB.Close()` or
    `Replica.Stop(true)` while your application still has open database
    connections. Either close all your app's database connections first, or only
    close Litestream when your process is shutting down.
 
-3. **PRAGMA Configuration**: Use DSN parameters (e.g.,
-   `?_pragma=busy_timeout(5000)`) instead of `PRAGMA` statements via
-   `ExecContext`. An `sql.DB` is a connection pool, and `ExecContext` only
-   applies the PRAGMA to one random connection from the pool.
+3. **PRAGMA Configuration**: Use DSN parameters (e.g., `?_busy_timeout=5000`)
+   or a `ConnectHook` instead of `PRAGMA` statements via `ExecContext`. An
+   `sql.DB` is a connection pool, and `ExecContext` only applies the PRAGMA to
+   one random connection from the pool.
 
 ## Examples
 
@@ -81,7 +85,7 @@ import (
     "database/sql"
     "github.com/benbjohnson/litestream"
     "github.com/benbjohnson/litestream/file"  // or s3, gs, abs, etc.
-    _ "modernc.org/sqlite"
+    _ "github.com/mattn/go-sqlite3"
 )
 
 // 1. Create database wrapper

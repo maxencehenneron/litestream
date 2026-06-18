@@ -18,13 +18,32 @@ import (
 	"sync"
 	"time"
 
+	sqlite3 "github.com/mattn/go-sqlite3"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/superfly/ltx"
-	"modernc.org/sqlite"
 
 	"github.com/benbjohnson/litestream/internal"
 )
+
+// litestreamDriverName is a mattn/go-sqlite3 driver registered with a
+// ConnectHook that disables SQLite's automatic checkpointing on every
+// connection. Litestream must control checkpoints itself, so wal_autocheckpoint
+// has to be 0 on every pooled connection (the modernc.org/sqlite driver
+// previously enforced this via the per-connection "_pragma=" DSN option, which
+// mattn/go-sqlite3 does not support).
+const litestreamDriverName = "litestream-sqlite3"
+
+func init() {
+	sql.Register(litestreamDriverName, &sqlite3.SQLiteDriver{
+		ConnectHook: func(conn *sqlite3.SQLiteConn) error {
+			if _, err := conn.Exec("PRAGMA wal_autocheckpoint = 0", nil); err != nil {
+				return fmt.Errorf("disable wal_autocheckpoint: %w", err)
+			}
+			return nil
+		},
+	})
+}
 
 // Default DB settings.
 const (
@@ -929,14 +948,13 @@ func (db *DB) setPersistWAL(ctx context.Context) error {
 	defer conn.Close()
 
 	return conn.Raw(func(driverConn interface{}) error {
-		fc, ok := driverConn.(sqlite.FileControl)
+		sc, ok := driverConn.(*sqlite3.SQLiteConn)
 		if !ok {
-			return fmt.Errorf("driver does not implement FileControl")
+			return fmt.Errorf("driver connection is not *sqlite3.SQLiteConn")
 		}
 
-		_, err := fc.FileControlPersistWAL("main", 1)
-		if err != nil {
-			return fmt.Errorf("FileControlPersistWAL: %w", err)
+		if err := sc.SetFileControlInt("main", sqlite3.SQLITE_FCNTL_PERSIST_WAL, 1); err != nil {
+			return fmt.Errorf("set PERSIST_WAL file control: %w", err)
 		}
 
 		return nil
@@ -966,10 +984,11 @@ func (db *DB) init(ctx context.Context) (err error) {
 	}
 	db.dirInfo = fi
 
-	dsn := fmt.Sprintf("file:%s?_pragma=busy_timeout(%d)&_pragma=wal_autocheckpoint(0)",
-		db.path, db.BusyTimeout.Milliseconds())
+	// busy_timeout is passed via the DSN (per database instance); wal_autocheckpoint
+	// is disabled per-connection by the litestreamDriverName ConnectHook.
+	dsn := fmt.Sprintf("file:%s?_busy_timeout=%d", db.path, db.BusyTimeout.Milliseconds())
 
-	if db.db, err = sql.Open("sqlite", dsn); err != nil {
+	if db.db, err = sql.Open(litestreamDriverName, dsn); err != nil {
 		return err
 	}
 

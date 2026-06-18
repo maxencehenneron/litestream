@@ -11,7 +11,11 @@ builds:
     main: ./cmd/litestream
     binary: litestream
     env:
-      - CGO_ENABLED=0
+      # github.com/mattn/go-sqlite3 requires cgo. Cross-compiling this matrix
+      # (linux/darwin/windows x amd64/arm64/arm) needs a C toolchain per target;
+      # see the Makefile for the CC mappings (e.g. aarch64-linux-gnu-gcc) and set
+      # the matching CC per goos/goarch (e.g. via goreleaser overrides or zig cc).
+      - CGO_ENABLED=1
     goos:
       - linux
       - darwin
